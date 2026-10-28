@@ -14,8 +14,10 @@ export class GeminiProvider extends AIProvider {
   constructor(config) {
     super('gemini');
     this.apiKey = config.gemini.apiKey || '';
-    this.modelName = config.gemini.model || 'gemini-3.5-flash';
+    this.modelName = config.gemini.model || 'gemini-flash-lite-latest';
     this.timeoutMs = config.timeoutMs || 60000;
+    this.lastHealthCheck = null;
+    this.lastHealthCheckTime = 0;
 
     if (this.apiKey) {
       this.client = new GoogleGenerativeAI(this.apiKey);
@@ -25,7 +27,8 @@ export class GeminiProvider extends AIProvider {
   }
 
   /**
-   * Validates API connectivity with Gemini
+   * Validates API connectivity with Gemini using countTokens to avoid consuming daily generateContent quota.
+   * Caches results for 60 seconds to avoid unnecessary network roundtrips.
    */
   async healthCheck() {
     const startTime = Date.now();
@@ -39,23 +42,55 @@ export class GeminiProvider extends AIProvider {
       };
     }
 
+    const now = Date.now();
+    if (this.lastHealthCheck && this.lastHealthCheck.status === 'connected' && (now - this.lastHealthCheckTime < 60000)) {
+      return {
+        ...this.lastHealthCheck,
+        responseTimeMs: 0,
+      };
+    }
+
     try {
       const model = this.client.getGenerativeModel({ model: this.modelName });
-      const result = await Promise.race([
-        model.generateContent('Health check ping. Reply with "OK" in 2 words.'),
+      await Promise.race([
+        model.countTokens('health check ping'),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('Timeout during Gemini health check')), 8000)
         ),
       ]);
 
-      const text = result.response.text();
-      return {
+      const result = {
         status: 'connected',
         provider: 'gemini',
         model: this.modelName,
         responseTimeMs: Date.now() - startTime,
       };
+      this.lastHealthCheck = result;
+      this.lastHealthCheckTime = now;
+      return result;
     } catch (err) {
+      // If primary model failed (e.g. 404 or quota), test available fallback models
+      const fallbackModels = ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite'];
+      for (const altModel of fallbackModels) {
+        if (altModel === this.modelName) continue;
+        try {
+          const alt = this.client.getGenerativeModel({ model: altModel });
+          await alt.countTokens('health check ping');
+          this.modelName = altModel;
+          const result = {
+            status: 'connected',
+            provider: 'gemini',
+            model: this.modelName,
+            responseTimeMs: Date.now() - startTime,
+          };
+          this.lastHealthCheck = result;
+          this.lastHealthCheckTime = now;
+          return result;
+        } catch {
+          // continue to next fallback
+        }
+      }
+
       logger.error('Gemini healthCheck failed', err);
       return {
         status: 'error',
@@ -72,42 +107,60 @@ export class GeminiProvider extends AIProvider {
       throw new Error('GEMINI_API_KEY is missing. Please configure it in your backend environment.');
     }
 
-    try {
-      const generationConfig = {
-        temperature: 0.2,
-      };
+    const candidateModels = [
+      this.modelName,
+      'gemini-flash-lite-latest',
+      'gemini-3.5-flash-lite',
+    ].filter((m, i, arr) => arr.indexOf(m) === i);
 
-      if (jsonMode) {
-        generationConfig.responseMimeType = 'application/json';
+    let lastErr = null;
+
+    for (const candidate of candidateModels) {
+      try {
+        const generationConfig = {
+          temperature: 0.2,
+        };
+
+        if (jsonMode) {
+          generationConfig.responseMimeType = 'application/json';
+        }
+
+        const model = this.client.getGenerativeModel({
+          model: candidate,
+          systemInstruction,
+          generationConfig,
+        });
+
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Gemini request timed out after ${this.timeoutMs / 1000}s`)), this.timeoutMs)
+        );
+
+        const result = await Promise.race([
+          model.generateContent(userPrompt),
+          timeoutPromise,
+        ]);
+
+        const text = result.response.text();
+        this.modelName = candidate;
+        return text;
+      } catch (err) {
+        lastErr = err;
+        if (err.status === 429 || err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED') || err.status === 404) {
+          logger.warn(`Gemini model ${candidate} quota reached or unavailable. Trying fallback model...`);
+          continue;
+        }
+        break;
       }
-
-      const model = this.client.getGenerativeModel({
-        model: this.modelName,
-        systemInstruction,
-        generationConfig,
-      });
-
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Gemini request timed out after ${this.timeoutMs / 1000}s`)), this.timeoutMs)
-      );
-
-      const result = await Promise.race([
-        model.generateContent(userPrompt),
-        timeoutPromise,
-      ]);
-
-      const text = result.response.text();
-      return text;
-    } catch (err) {
-      if (err.status === 429 || err.message?.includes('RESOURCE_EXHAUSTED')) {
-        throw new Error('Google Gemini API quota exceeded or rate limit reached. Please wait a moment or switch to local Ollama.');
-      }
-      if (err.status === 400 && err.message?.includes('API_KEY_INVALID')) {
-        throw new Error('Invalid Google Gemini API key. Please check GEMINI_API_KEY in backend/.env.');
-      }
-      logger.error('Gemini generate error', err);
-      throw new Error(err.message || 'Gemini API call failed');
     }
+
+    if (lastErr?.status === 429 || lastErr?.message?.includes('429') || lastErr?.message?.includes('RESOURCE_EXHAUSTED')) {
+      throw new Error('Google Gemini API quota exceeded or rate limit reached. Please wait a moment or switch to local Ollama.');
+    }
+    if (lastErr?.status === 400 && lastErr?.message?.includes('API_KEY_INVALID')) {
+      throw new Error('Invalid Google Gemini API key. Please check GEMINI_API_KEY in backend/.env.');
+    }
+    logger.error('Gemini generate error', lastErr);
+    throw new Error(lastErr?.message || 'Gemini API call failed');
   }
 
   async chat({ messages, language }) {
@@ -116,27 +169,45 @@ export class GeminiProvider extends AIProvider {
     }
 
     const systemInstruction = `${BASE_SYSTEM_PROMPT}\nTarget programming language context: ${language || 'general'}`;
-    const model = this.client.getGenerativeModel({
-      model: this.modelName,
-      systemInstruction,
-    });
+    const candidateModels = [
+      this.modelName,
+      'gemini-flash-lite-latest',
+      'gemini-3.5-flash-lite',
+    ].filter((m, i, arr) => arr.indexOf(m) === i);
 
-    // Format chat history for Gemini SDK
-    // Gemini expects { role: 'user' | 'model', parts: [{ text }] }
     const history = messages.slice(0, -1).map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }],
     }));
 
     const lastMessage = messages[messages.length - 1]?.content || 'Hello';
-    const chat = model.startChat({ history });
-    const result = await chat.sendMessage(lastMessage);
+    let lastErr = null;
 
-    return {
-      message: result.response.text(),
-      provider: 'gemini',
-      model: this.modelName,
-    };
+    for (const candidate of candidateModels) {
+      try {
+        const model = this.client.getGenerativeModel({
+          model: candidate,
+          systemInstruction,
+        });
+        const chat = model.startChat({ history });
+        const result = await chat.sendMessage(lastMessage);
+        this.modelName = candidate;
+        return {
+          message: result.response.text(),
+          provider: 'gemini',
+          model: candidate,
+        };
+      } catch (err) {
+        lastErr = err;
+        if (err.status === 429 || err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED') || err.status === 404) {
+          logger.warn(`Gemini chat model ${candidate} quota reached. Trying fallback model...`);
+          continue;
+        }
+        break;
+      }
+    }
+
+    throw lastErr;
   }
 
   async explain({ code, language }) {

@@ -64,3 +64,4 @@ npm run dev
 Server listens on: `http://localhost:5000/`  
 Health check: `http://localhost:5000/api/health`  
 AI Health: `http://localhost:5000/api/health/ai`
+
