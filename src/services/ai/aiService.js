@@ -3,34 +3,79 @@ import { OllamaProvider } from './ollamaProvider.js';
 import { GeminiProvider } from './geminiProvider.js';
 import { logger } from '../../utils/logger.js';
 
-let activeProvider = null;
+let ollamaInstance = null;
+let geminiInstance = null;
+let activeProviderOverride = null;
+let currentProviderType = (config.ai.provider || 'gemini').toLowerCase().trim();
+
+function getOllamaInstance() {
+  if (!ollamaInstance) {
+    ollamaInstance = new OllamaProvider(config.ai);
+  }
+  return ollamaInstance;
+}
+
+function getGeminiInstance() {
+  if (!geminiInstance) {
+    geminiInstance = new GeminiProvider(config.ai);
+  }
+  return geminiInstance;
+}
 
 /**
- * Initializes and returns the active AI provider singleton according to configuration.
+ * Initializes and returns the active AI provider singleton according to configuration or override.
  */
 export function getActiveAIProvider() {
-  if (activeProvider) return activeProvider;
+  if (activeProviderOverride) return activeProviderOverride;
 
-  const providerType = config.ai.provider;
-  logger.info(`Initializing AI Provider: '${providerType}'`);
-
-  if (providerType === 'gemini') {
-    activeProvider = new GeminiProvider(config.ai);
-  } else if (providerType === 'ollama') {
-    activeProvider = new OllamaProvider(config.ai);
-  } else {
-    logger.warn(`Unrecognized provider '${providerType}'. Defaulting to Ollama.`);
-    activeProvider = new OllamaProvider(config.ai);
+  if (currentProviderType === 'ollama') {
+    return getOllamaInstance();
   }
+  return getGeminiInstance();
+}
 
-  return activeProvider;
+/**
+ * Switch active provider on the fly ('ollama' or 'gemini')
+ */
+export function switchActiveProvider(providerName) {
+  const norm = (providerName || '').toLowerCase().trim();
+  if (norm === 'ollama' || norm === 'gemini') {
+    currentProviderType = norm;
+    logger.info(`Switched active AI Provider to '${norm}'`);
+    return true;
+  }
+  return false;
 }
 
 /**
  * For testing purposes: allows injecting a custom or mock AI provider.
  */
 export function setActiveAIProvider(provider) {
-  activeProvider = provider;
+  activeProviderOverride = provider;
+}
+
+/**
+ * Unified execution wrapper that provides automatic failover between Ollama and Gemini.
+ * If offline or daemon unreachable, it seamlessly routes to the alternative provider.
+ */
+async function executeWithFallback(actionName, actionFn) {
+  const primary = getActiveAIProvider();
+  try {
+    return await actionFn(primary);
+  } catch (err) {
+    logger.warn(`Primary AI provider '${primary.name}' failed during ${actionName}: ${err.message}. Checking backup...`);
+
+    // Determine backup provider
+    const backup = primary.name === 'gemini' ? getOllamaInstance() : getGeminiInstance();
+    try {
+      const backupResult = await actionFn(backup);
+      logger.info(`Failover to backup AI provider '${backup.name}' succeeded for ${actionName}`);
+      return backupResult;
+    } catch (backupErr) {
+      logger.error(`Backup AI provider '${backup.name}' also failed: ${backupErr.message}`);
+      throw err;
+    }
+  }
 }
 
 /**
@@ -57,13 +102,45 @@ export async function logActivity(supabase, { userId, activityType, language, to
  */
 export const aiService = {
   async healthCheck() {
-    const provider = getActiveAIProvider();
-    return provider.healthCheck();
+    const primary = getActiveAIProvider();
+    const primaryHealth = await primary.healthCheck();
+
+    if (primaryHealth.status === 'connected') {
+      return {
+        ...primaryHealth,
+        activeProvider: primary.name,
+        availableProviders: ['gemini', 'ollama'],
+      };
+    }
+
+    // Try probing backup provider
+    const backup = primary.name === 'gemini' ? getOllamaInstance() : getGeminiInstance();
+    try {
+      const backupHealth = await backup.healthCheck();
+      if (backupHealth.status === 'connected') {
+        return {
+          ...backupHealth,
+          activeProvider: backup.name,
+          failoverActive: true,
+          notice: `Primary provider (${primary.name}) unavailable; automatically routed to ${backup.name}.`,
+          availableProviders: ['gemini', 'ollama'],
+        };
+      }
+    } catch (e) {
+      // Ignore backup error and return primary
+    }
+
+    return {
+      ...primaryHealth,
+      activeProvider: primary.name,
+      availableProviders: ['gemini', 'ollama'],
+    };
   },
 
   async explainCode({ code, language, user, supabase }) {
-    const provider = getActiveAIProvider();
-    const explanation = await provider.explain({ code, language });
+    const explanation = await executeWithFallback('explainCode', (provider) =>
+      provider.explain({ code, language })
+    );
 
     if (user && supabase) {
       await logActivity(supabase, {
@@ -81,13 +158,14 @@ export const aiService = {
   },
 
   async debugCode({ code, language, errorMessage, expectedBehavior, user, supabase }) {
-    const provider = getActiveAIProvider();
-    const debugResult = await provider.debug({
-      code,
-      language,
-      errorMessage,
-      expectedBehavior,
-    });
+    const debugResult = await executeWithFallback('debugCode', (provider) =>
+      provider.debug({
+        code,
+        language,
+        errorMessage,
+        expectedBehavior,
+      })
+    );
 
     if (user && supabase) {
       await logActivity(supabase, {
@@ -105,8 +183,9 @@ export const aiService = {
   },
 
   async generatePracticeProblem({ language, difficulty, topic, user, supabase }) {
-    const provider = getActiveAIProvider();
-    const problemData = await provider.generatePractice({ language, difficulty, topic });
+    const problemData = await executeWithFallback('generatePracticeProblem', (provider) =>
+      provider.generatePractice({ language, difficulty, topic })
+    );
 
     // If user and supabase client provided, persist into practice_problems
     let savedProblem = null;
@@ -151,8 +230,6 @@ export const aiService = {
   },
 
   async getHint({ problemId, level, currentCode, user, supabase }) {
-    const provider = getActiveAIProvider();
-
     // Fetch problem details to ground hint accurately
     let problem = { title: 'Practice Problem', description: 'Problem context', language: 'python' };
     if (supabase) {
@@ -164,11 +241,12 @@ export const aiService = {
       if (data) problem = data;
     }
 
-    const hintData = await provider.generateHint({ problem, level, currentCode });
+    const hintData = await executeWithFallback('getHint', (provider) =>
+      provider.generateHint({ problem, level, currentCode })
+    );
 
     // Track attempt hint usage in practice_attempts
     if (user && supabase) {
-      // Find or create practice attempt
       const { data: existingAttempt } = await supabase
         .from('practice_attempts')
         .select('*')
@@ -210,8 +288,6 @@ export const aiService = {
   },
 
   async getSolution({ problemId, user, supabase }) {
-    const provider = getActiveAIProvider();
-
     let problem = { title: 'Practice Problem', description: 'Problem context', language: 'python' };
     if (supabase) {
       const { data } = await supabase
@@ -222,7 +298,9 @@ export const aiService = {
       if (data) problem = data;
     }
 
-    const solutionData = await provider.generateSolution({ problem });
+    const solutionData = await executeWithFallback('getSolution', (provider) =>
+      provider.generateSolution({ problem })
+    );
 
     if (user && supabase) {
       await logActivity(supabase, {
@@ -238,11 +316,8 @@ export const aiService = {
   },
 
   async chat({ conversationId, message, language, user, supabase }) {
-    const provider = getActiveAIProvider();
-
     let messages = [{ role: 'user', content: message }];
 
-    // If conversationId exists and supabase is available, fetch previous messages
     if (conversationId && supabase) {
       const { data: history } = await supabase
         .from('conversation_messages')
@@ -255,7 +330,6 @@ export const aiService = {
         messages = [...history, { role: 'user', content: message }];
       }
 
-      // Record student message
       await supabase.from('conversation_messages').insert({
         conversation_id: conversationId,
         role: 'user',
@@ -263,9 +337,10 @@ export const aiService = {
       });
     }
 
-    const response = await provider.chat({ messages, language });
+    const response = await executeWithFallback('chat', (provider) =>
+      provider.chat({ messages, language })
+    );
 
-    // Record AI assistant response
     if (conversationId && supabase) {
       await supabase.from('conversation_messages').insert({
         conversation_id: conversationId,
@@ -273,7 +348,6 @@ export const aiService = {
         content: response.message,
       });
 
-      // Update conversation updated_at
       await supabase
         .from('conversations')
         .update({ updated_at: new Date().toISOString() })
@@ -290,4 +364,3 @@ export const aiService = {
     return response;
   },
 };
-

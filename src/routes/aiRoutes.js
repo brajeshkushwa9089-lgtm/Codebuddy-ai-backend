@@ -14,8 +14,9 @@ import {
 
 const router = Router();
 
-// Public AI health check
+// Public AI health check & dynamic switching
 router.get('/health', aiController.health);
+router.post('/switch', aiController.switchProvider);
 
 // AI Tutoring & Generation Endpoints (protected & rate-limited)
 router.post(

@@ -112,5 +112,16 @@ export const aiController = {
       next(err);
     }
   },
+
+  async switchProvider(req, res) {
+    const { provider } = req.body;
+    const { switchActiveProvider } = await import('../services/ai/aiService.js');
+    const ok = switchActiveProvider(provider);
+    if (!ok) {
+      return res.status(400).json({ error: { message: "Invalid provider. Must be 'ollama' or 'gemini'." } });
+    }
+    const health = await aiService.healthCheck();
+    return res.json({ message: `Active AI provider switched to ${provider}`, ...health });
+  },
 };
 
