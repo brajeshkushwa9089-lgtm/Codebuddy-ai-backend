@@ -15,51 +15,22 @@ app.use(
   })
 );
 
-// Dynamic CORS configuration supporting localhost and local network IPs (e.g. 10.x.x.x, 192.168.x.x)
-const allowedOrigins = [
-  config.frontendOrigin,
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'http://localhost:5000',
-  'http://127.0.0.1:5000',
-];
-
-const isOriginAllowed = (origin) => {
-  if (!origin) return true; // allow curl, mobile apps, same-origin
-  if (allowedOrigins.includes(origin)) return true;
-
-  try {
-    const url = new URL(origin);
-    // Allow any localhost port or private LAN IP in development
-    if (
-      url.hostname === 'localhost' ||
-      url.hostname === '127.0.0.1' ||
-      url.hostname.startsWith('10.') ||
-      url.hostname.startsWith('192.168.') ||
-      url.hostname.startsWith('172.')
-    ) {
-      return true;
-    }
-  } catch {
-    // Malformed origin URL
-  }
-
-  return false;
-};
-
+// Universal CORS configuration supporting production Vercel, Render, local dev, and mobile
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error(`CORS blocked for origin: ${origin}`));
+      // Reflect the request origin so withCredentials / Bearer headers work from any client
+      callback(null, true);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+    optionsSuccessStatus: 200,
   })
 );
+
+// Explicit preflight handler for all routes
+app.options('*', cors());
 
 // Payload size limits to protect server resources
 app.use(express.json({ limit: '1mb' }));
