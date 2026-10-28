@@ -1,0 +1,28 @@
+{
+  "name": "codebuddy-backend",
+  "version": "1.0.0",
+  "description": "CodeBuddy AI - Educational Programming Companion REST API",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "axios": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0",
+    "vitest": "^3.0.7"
+  }
+}
