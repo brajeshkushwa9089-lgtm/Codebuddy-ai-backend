@@ -14,7 +14,7 @@ export class GeminiProvider extends AIProvider {
   constructor(config) {
     super('gemini');
     this.apiKey = config.gemini.apiKey || '';
-    this.modelName = config.gemini.model || 'gemini-1.5-flash';
+    this.modelName = config.gemini.model || 'gemini-3.5-flash';
     this.timeoutMs = config.timeoutMs || 60000;
 
     if (this.apiKey) {
